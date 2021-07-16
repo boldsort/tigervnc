@@ -54,8 +54,18 @@
 #include <Carbon/Carbon.h>
 #endif
 
-#define EDGE_SCROLL_SIZE 32
-#define EDGE_SCROLL_SPEED 20
+// width of each "edge" region where scrolling happens,
+// as a ratio compared to the viewport size
+// default: 1/16th of the viewport size
+#define EDGE_SCROLL_SIZE 16
+// edge width is calculated at runtime; these values are just examples
+static int edge_scroll_size_x = 128;
+static int edge_scroll_size_y = 96;
+// maximum pixels to scroll per frame
+#define EDGE_SCROLL_SPEED 16
+// how long to wait between viewport scroll position changes
+// default: roughly 60 fps for smooth motion
+#define EDGE_SCROLL_SECONDS_PER_FRAME 0.016666
 
 using namespace rfb;
 
@@ -455,9 +465,34 @@ void DesktopWindow::draw()
 
     // Make sure it's properly seen by adjusting it relative to the
     // primary screen rather than the entire window
-    if (fullscreen_active() && fullScreenAllMonitors) {
+    if (fullscreen_active()) {
       assert(Fl::screen_count() >= 1);
-      Fl::screen_xywh(sx, sy, sw, sh, 0);
+
+      rfb::Rect window_rect, screen_rect;
+      window_rect.setXYWH(x(), y(), w(), h());
+
+      bool found_enclosed_screen = false;
+      for (int i = 0; i < Fl::screen_count(); i++) {
+        Fl::screen_xywh(sx, sy, sw, sh, i);
+
+        // The screen with the smallest index that are enclosed by
+        // the viewport will be used for showing the overlay.
+        screen_rect.setXYWH(sx, sy, sw, sh);
+        if (screen_rect.enclosed_by(window_rect)) {
+          found_enclosed_screen = true;
+          break;
+        }
+      }
+
+      // If no monitor inside the viewport was found,
+      // use the one primary instead.
+      if (!found_enclosed_screen)
+        Fl::screen_xywh(sx, sy, sw, sh, 0);
+
+      // Adjust the coordinates so they are relative to the viewport.
+      sx -= x();
+      sy -= y();
+
     } else {
       sx = 0;
       sy = 0;
@@ -598,6 +633,11 @@ void DesktopWindow::resize(int x, int y, int w, int h)
 
     repositionWidgets();
   }
+
+  // Some systems require a grab after the window size has been changed.
+  // Otherwise they might hold on to displays, resulting in them being unusable.
+  if (fullscreen_active() && fullscreenSystemKeys)
+    grabKeyboard();
 }
 
 
@@ -768,12 +808,16 @@ int DesktopWindow::handle(int event)
       }
     }
     if (fullscreen_active()) {
-      if (((viewport->x() < 0) && (Fl::event_x() < EDGE_SCROLL_SIZE)) ||
-          ((viewport->x() + viewport->w() > w()) && (Fl::event_x() > w() - EDGE_SCROLL_SIZE)) ||
-          ((viewport->y() < 0) && (Fl::event_y() < EDGE_SCROLL_SIZE)) ||
-          ((viewport->y() + viewport->h() > h()) && (Fl::event_y() > h() - EDGE_SCROLL_SIZE))) {
+      // calculate width of "edge" regions
+      edge_scroll_size_x = viewport->w() / EDGE_SCROLL_SIZE;
+      edge_scroll_size_y = viewport->h() / EDGE_SCROLL_SIZE;
+      // if cursor is near the edge of the viewport, scroll
+      if (((viewport->x() < 0) && (Fl::event_x() < edge_scroll_size_x)) ||
+          ((viewport->x() + viewport->w() >= w()) && (Fl::event_x() >= w() - edge_scroll_size_x)) ||
+          ((viewport->y() < 0) && (Fl::event_y() < edge_scroll_size_y)) ||
+          ((viewport->y() + viewport->h() >= h()) && (Fl::event_y() >= h() - edge_scroll_size_y))) {
         if (!Fl::has_timeout(handleEdgeScroll, this))
-          Fl::add_timeout(0.1, handleEdgeScroll, this);
+          Fl::add_timeout(EDGE_SCROLL_SECONDS_PER_FRAME, handleEdgeScroll, this);
       }
     }
     // Continue processing so that the viewport also gets mouse events
@@ -836,41 +880,71 @@ int DesktopWindow::fltkHandle(int event, Fl_Window *win)
   return ret;
 }
 
-
 void DesktopWindow::fullscreen_on()
 {
-  if (not fullScreenAllMonitors)
-    fullscreen_screens(-1, -1, -1, -1);
-  else {
+  bool all_monitors = !strcasecmp(fullScreenMode, "all");
+  bool selected_monitors = !strcasecmp(fullScreenMode, "selected");
+
+  if (not selected_monitors and not all_monitors) {
+    int n = Fl::screen_num(x(), y(), w(), h());
+    fullscreen_screens(n, n, n, n);
+  } else {
     int top, bottom, left, right;
     int top_y, bottom_y, left_x, right_x;
 
     int sx, sy, sw, sh;
 
-    top = bottom = left = right = 0;
+    std::set<int> monitors;
 
-    Fl::screen_xywh(sx, sy, sw, sh, 0);
+    if (selected_monitors and not all_monitors) {
+      std::set<int> selected = fullScreenSelectedMonitors.getParam();
+      monitors.insert(selected.begin(), selected.end());
+    } else {
+      for (int i = 0; i < Fl::screen_count(); i++) {
+        monitors.insert(i);
+      }
+    }
+
+    // If no monitors were found in the selected monitors case, we want
+    // to explicitly use the window's current monitor.
+    if (monitors.size() == 0) {
+      monitors.insert(Fl::screen_num(x(), y(), w(), h()));
+    }
+
+    // If there are monitors selected, calculate the dimensions
+    // of the frame buffer, expressed in the monitor indices that
+    // limits it.
+    std::set<int>::iterator it = monitors.begin();
+
+    // Get first monitor dimensions.
+    Fl::screen_xywh(sx, sy, sw, sh, *it);
+    top = bottom = left = right = *it;
     top_y = sy;
     bottom_y = sy + sh;
     left_x = sx;
     right_x = sx + sw;
 
-    for (int i = 1;i < Fl::screen_count();i++) {
-      Fl::screen_xywh(sx, sy, sw, sh, i);
+    // Keep going through the rest of the monitors.
+    for (; it != monitors.end(); it++) {
+      Fl::screen_xywh(sx, sy, sw, sh, *it);
+
       if (sy < top_y) {
-        top = i;
+        top = *it;
         top_y = sy;
       }
+
       if ((sy + sh) > bottom_y) {
-        bottom = i;
+        bottom = *it;
         bottom_y = sy + sh;
       }
+
       if (sx < left_x) {
-        left = i;
+        left = *it;
         left_x = sx;
       }
+
       if ((sx + sw) > right_x) {
-        right = i;
+        right = *it;
         right_x = sx + sw;
       }
     }
@@ -918,7 +992,7 @@ void DesktopWindow::grabKeyboard()
 #elif defined(__APPLE__)
   int ret;
   
-  ret = cocoa_capture_display(this, fullScreenAllMonitors);
+  ret = cocoa_capture_displays(this);
   if (ret != 0) {
     vlog.error(_("Failure grabbing keyboard"));
     return;
@@ -974,7 +1048,7 @@ void DesktopWindow::ungrabKeyboard()
 #if defined(WIN32)
   win32_disable_lowlevel_keyboard(fl_xid(this));
 #elif defined(__APPLE__)
-  cocoa_release_display(this);
+  cocoa_release_displays(this);
 #else
   // FLTK has a grab so lets not mess with it
   if (Fl::grab())
@@ -1333,7 +1407,7 @@ void DesktopWindow::handleOptions(void *data)
     self->ungrabKeyboard();
 
   // Call fullscreen_on even if active since it handles
-  // fullScreenAllMonitors
+  // fullScreenMode
   if (fullScreen)
     self->fullscreen_on();
   else if (!fullScreen && self->fullscreen_active())
@@ -1408,27 +1482,27 @@ void DesktopWindow::handleEdgeScroll(void *data)
   if (my > self->h())
     my = self->h();
 
-  if ((self->viewport->x() < 0) && (mx < EDGE_SCROLL_SIZE))
+  if ((self->viewport->x() < 0) && (mx < edge_scroll_size_x))
     dx = EDGE_SCROLL_SPEED -
-         EDGE_SCROLL_SPEED * mx / EDGE_SCROLL_SIZE;
-  if ((self->viewport->x() + self->viewport->w() > self->w()) &&
-      (mx > self->w() - EDGE_SCROLL_SIZE))
-    dx = EDGE_SCROLL_SPEED * (self->w() - mx) / EDGE_SCROLL_SIZE -
-         EDGE_SCROLL_SPEED;
-  if ((self->viewport->y() < 0) && (my < EDGE_SCROLL_SIZE))
+         EDGE_SCROLL_SPEED * mx / edge_scroll_size_x;
+  if ((self->viewport->x() + self->viewport->w() >= self->w()) &&
+      (mx >= self->w() - edge_scroll_size_x))
+    dx = EDGE_SCROLL_SPEED * (self->w() - mx) / edge_scroll_size_x -
+         EDGE_SCROLL_SPEED - 1;
+  if ((self->viewport->y() < 0) && (my < edge_scroll_size_y))
     dy = EDGE_SCROLL_SPEED -
-         EDGE_SCROLL_SPEED * my / EDGE_SCROLL_SIZE;
-  if ((self->viewport->y() + self->viewport->h() > self->h()) &&
-      (my > self->h() - EDGE_SCROLL_SIZE))
-    dy = EDGE_SCROLL_SPEED * (self->h() - my) / EDGE_SCROLL_SIZE -
-         EDGE_SCROLL_SPEED;
+         EDGE_SCROLL_SPEED * my / edge_scroll_size_y;
+  if ((self->viewport->y() + self->viewport->h() >= self->h()) &&
+      (my >= self->h() - edge_scroll_size_y))
+    dy = EDGE_SCROLL_SPEED * (self->h() - my) / edge_scroll_size_y -
+         EDGE_SCROLL_SPEED - 1;
 
   if ((dx == 0) && (dy == 0))
     return;
 
   self->scrollTo(self->hscroll->value() - dx, self->vscroll->value() - dy);
 
-  Fl::repeat_timeout(0.1, handleEdgeScroll, data);
+  Fl::repeat_timeout(EDGE_SCROLL_SECONDS_PER_FRAME, handleEdgeScroll, data);
 }
 
 void DesktopWindow::handleStatsTimeout(void *data)
